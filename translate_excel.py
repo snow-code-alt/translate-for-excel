@@ -14,12 +14,12 @@ import string  # 用于列号字母转数字
 
 # ==================== 配置区域 ====================
 # 有道翻译API配置
-YOUDAO_APP_KEY = '1ffaa7e3a571d047'  # 替换为你的有道AppKey
-YOUDAO_APP_SECRET = 'gIt1cpx6wToGX2UFIYDRWplVRP2k3umJ'  # 替换为你的有道AppSecret
+YOUDAO_APP_KEY = ''  # 替换为你的有道AppKey
+YOUDAO_APP_SECRET = ''  # 替换为你的有道AppSecret
 YOUDAO_API_URL = 'https://openapi.youdao.com/api'
 
 # DeepL翻译API配置
-DEEPL_API_KEY = '28df4eab-f4e0-47cb-92a6-784b364b6e9e:fx'  # 替换为你的DeepL API密钥
+DEEPL_API_KEY = ''  # 替换为你的DeepL API密钥
 DEEPL_API_URL = 'https://api-free.deepl.com/v2/translate'  # DeepL免费版API地址
 # 如果使用DeepL Pro（付费版），使用：'https://api.deepl.com/v2/translate'
 
