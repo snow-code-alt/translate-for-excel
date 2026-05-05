@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""
+translate_word.py
+
+Translate a .docx while trying to preserve formatting.
+
+Features:
+- Traverse paragraphs, runs, tables, headers and footers.
+- Modular translation backend interface:
+    - GoogleTranslateBackend (google-cloud-translate v3)
+    - HttpTranslateBackend (generic REST API you can plug in)
+- CLI: choose target language, backend and backend credentials.
+- Attempts simple retry logic on transient failures.
+
+Limitations:
+- .doc (binary) is not supported directly; convert to .docx first (e.g., libreoffice --headless --convert-to docx).
+- Complex embedded objects, some text-in-shapes, SmartArt or OLE objects may not be translated.
+- Precise run->run styling preservation is attempted by replacing run.text; but because translated text length differs, layout may shift.
+"""
+
+from docx import Document
+from google.cloud.translate import TranslationServiceClient
+import argparse
+import os
+import time
+import requests
+from typing import Callable, Optional
+
+# ----- backend interface and implementations -----
+class TranslateBackend:
+    """Abstract interface: translate(text, target_language) -> translated_text"""
+    def translate(self, text: str, target: str) -> str:
+        raise NotImplementedError()
+
+class GoogleTranslateBackend(TranslateBackend):
+    """Uses Google Cloud Translate v3 (TranslationServiceClient). Requires GCP auth env var or ADC."""
+    def __init__(self, project_id: str, location: str = "global", retry_backoff: float = 0.5):
+        self.project_id = project_id
+        self.location = location
+        self.client = TranslationServiceClient()
+        self.parent = f"projects/{self.project_id}/locations/{self.location}"
+        self.retry_backoff = retry_backoff
+
+    def translate(self, text: str, target: str) -> str:
+        if not text or not text.strip():
+            return text
+        try:
+            response = self.client.translate_text(
+                request={
+                    "parent": self.parent,
+                    "contents": [text],
+                    "mime_type": "text/plain",
+                    "target_language_code": target,
+                }
+            )
+            return response.translations[0].translated_text
+        except Exception as e:
+            # simple retry once
+            time.sleep(self.retry_backoff)
+            response = self.client.translate_text(
+                request={
+                    "parent": self.parent,
+                    "contents": [text],
+                    "mime_type": "text/plain",
+                    "target_language_code": target,
+                }
+            )
+            return response.translations[0].translated_text
+
+class HttpTranslateBackend(TranslateBackend):
+    """
+    Generic HTTP backend wrapper.
+    You must provide:
+      - url: endpoint that accepts POST JSON with fields {text, target} (or configure accordingly)
+      - headers: dict for auth
+    The endpoint must return JSON with key 'translatedText' or 'translation' or 'translated'
+    Customize parse_response function if your provider returns different shape.
+    This is useful for DeepL, LibreTranslate, custom service, etc.
+    """
+    def __init__(self, url: str, headers: dict = None, parse_response: Callable[[dict], str] = None, retry_backoff: float = 0.5):
+        self.url = url
+        self.headers = headers or {}
+        self.parse_response = parse_response or (lambda d: d.get("translatedText") or d.get("translation") or d.get("translated") or "")
+        self.retry_backoff = retry_backoff
+
+    def translate(self, text: str, target: str) -> str:
+        if not text or not text.strip():
+            return text
+        payload = {"text": text, "target": target}
+        try:
+            r = requests.post(self.url, json=payload, headers=self.headers, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            return self.parse_response(data) or ""
+        except Exception as e:
+            # one retry
+            time.sleep(self.retry_backoff)
+            r = requests.post(self.url, json=payload, headers=self.headers, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            return self.parse_response(data) or ""
+
+# ----- docx traversal and translation utilities -----
+def translate_run_texts(paragraph, translate_fn: Callable[[str, str], str], target: str):
+    """
+    Translate each run individually to preserve run-level styling.
+    For better continuity you might want to join runs and translate per-paragraph,
+    but that makes redistributing text to runs harder.
+    """
+    for run in paragraph.runs:
+        orig = run.text
+        if orig and orig.strip():
+            try:
+                translated = translate_fn(orig, target)
+            except Exception:
+                # simple retry fallback inside translate_fn typically handled by backend,
+                # but keep minimal local safeguard
+                time.sleep(0.2)
+                translated = translate_fn(orig, target)
+            run.text = translated
+
+def translate_cell(cell, translate_fn: Callable[[str, str], str], target: str):
+    for p in cell.paragraphs:
+        translate_run_texts(p, translate_fn, target)
+
+def translate_docx(input_path: str, output_path: str, translate_fn: Callable[[str, str], str], target: str):
+    doc = Document(input_path)
+
+    # paragraphs in body
+    for p in doc.paragraphs:
+        translate_run_texts(p, translate_fn, target)
+
+    # tables
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                translate_cell(cell, translate_fn, target)
+
+    # headers and footers for each section
+    for section in doc.sections:
+        header = section.header
+        footer = section.footer
+        if header:
+            for p in header.paragraphs:
+                translate_run_texts(p, translate_fn, target)
+        if footer:
+            for p in footer.paragraphs:
+                translate_run_texts(p, translate_fn, target)
+
+    # Attempt to catch other text nodes (shapes/textboxes) by searching raw XML <w:t>
+    # This is a best-effort: modifying w:t directly can affect run segmentation but will catch extra text.
+    try:
+        body = doc.element
+        text_nodes = body.xpath('.//w:t')
+        for t in text_nodes:
+            txt = t.text
+            if txt and txt.strip():
+                try:
+                    newtxt = translate_fn(txt, target)
+                    t.text = newtxt
+                except Exception:
+                    time.sleep(0.1)
+                    t.text = translate_fn(txt, target)
+    except Exception:
+        # If low-level XML fails, ignore — most visible text already handled via runs/paragraphs.
+        pass
+
+    doc.save(output_path)
+
+# ----- CLI wiring -----
+def build_translate_fn_from_args(args) -> Callable[[str, str], str]:
+    if args.backend == "google":
+        if not args.gcp_project:
+            raise SystemExit("Google backend selected but --gcp-project not provided.")
+        backend = GoogleTranslateBackend(project_id=args.gcp_project, location=(args.gcp_location or "global"))
+        return backend.translate
+    elif args.backend == "http":
+        if not args.http_url:
+            raise SystemExit("HTTP backend selected but --http-url not provided.")
+        headers = {}
+        if args.http_key:
+            # default attach as Authorization: Bearer <key> unless user set --http-header
+            header_name = args.http_header or "Authorization"
+            header_value = f"Bearer {args.http_key}"
+            headers[header_name] = header_value
+        if args.http_headers:
+            # allow multiple headers in KEY:VALUE form separated by semicolon
+            for pair in args.http_headers.split(";"):
+                if ":" in pair:
+                    k, v = pair.split(":", 1)
+                    headers[k.strip()] = v.strip()
+        # default parse function expects {"translatedText": "..."} or {"translation":"..."}
+        backend = HttpTranslateBackend(url=args.http_url, headers=headers)
+        return backend.translate
+    else:
+        raise SystemExit("Unknown backend: " + str(args.backend))
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Translate .docx while preserving formatting as much as possible.")
+    p.add_argument("input", help="input .docx path")
+    p.add_argument("output", help="output .docx path")
+    p.add_argument("--target", "-t", required=True, help="target language code (e.g., en, zh, fr, de, ja)")
+    p.add_argument("--backend", "-b", choices=["google", "http"], default="google", help="translation backend to use")
+    # google-specific
+    p.add_argument("--gcp-project", help="GCP project id (for Google backend)")
+    p.add_argument("--gcp-location", help="GCP location (default: global)")
+    # http backend options
+    p.add_argument("--http-url", help="HTTP translation endpoint (expects POST JSON {text, target})")
+    p.add_argument("--http-key", help="API key for HTTP backend (will be used as Bearer token unless --http-header provided)")
+    p.add_argument("--http-header", help="Header name to put http-key into (default Authorization)")
+    p.add_argument("--http-headers", help="Additional headers for HTTP backend, format: 'K1:V1;K2:V2'")
+
+    return p.parse_args()
+
+def main():
+    args = parse_args()
+
+    if not os.path.exists(args.input):
+        raise SystemExit("Input not found: " + args.input)
+
+    translate_fn = build_translate_fn_from_args(args)
+
+    print(f"Translating {args.input} -> {args.output} to '{args.target}' using backend {args.backend} ...")
+    translate_docx(args.input, args.output, translate_fn, args.target)
+    print("Translation complete. Output:", args.output)
+
+if __name__ == "__main__":
+    main()
